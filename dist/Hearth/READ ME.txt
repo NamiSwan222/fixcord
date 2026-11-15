@@ -1,0 +1,45 @@
+Hearth - a small chat app
+=========================
+
+How to start it
+  Double-click Hearth.exe. Nothing needs installing.
+  Windows may show a blue "Windows protected your PC" box because the app isn't
+  signed by a company. Click "More info", then "Run anyway".
+
+Chat with each other
+  Hearth opens in the "Home Network" community (HN, on the left). Everyone running Hearth
+  on the same Wi-Fi or home network sees the messages there.
+  The first time, Windows Firewall may ask about Hearth: allow it on private networks.
+  It only works on the same network, not over the internet.
+
+Video and screen sharing
+  In the Home Network community, join the "Lounge" voice channel. Press "Video" to turn
+  your camera on or "Share screen" to show a screen or one app window to everyone in the
+  Lounge. You can pick the quality (480p to original size) and smoothness (5 to 60 frames
+  a second); the gear button on the voice screen changes them while you're live.
+  Click a box to make it big. Leaving the channel stops sharing.
+
+Voice chat
+  Everyone in the Lounge can talk and hear each other. Both of you need this version.
+  Settings > Voice & sound: pick your microphone and speakers, test your mic, choose
+  voice activity or push to talk, set volumes, and turn interface sounds on or off.
+  Right-click a friend on the voice screen to change just their volume.
+  Noise suppression (on by default) removes background noise from your mic.
+  Headphones avoid echo.
+
+Updates
+  Hearth checks for new versions by itself and installs them when you close it, or
+  right away with "Restart to update". Settings > Updates lets you check now or turn
+  this off. Hearth keeps the previous version as Hearth.old.exe until its next start.
+
+Sharing it with more friends
+  Send this zip through a shared drive link (Google Drive, OneDrive, Dropbox), a
+  file-transfer site or a USB stick. Email and many chat apps block programs, even
+  inside a zip. Steps are also in Hearth: Settings > Invite friends.
+
+Everything else
+  Friends and direct messages (the house button at the top left) are kept on your own
+  computer, with sample people who reply. Turn that off in Settings > Chat.
+  Settings is the gear at the bottom left.
+
+Your messages and settings are saved in %APPDATA%\Hearth on your computer.

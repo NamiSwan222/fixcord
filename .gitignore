@@ -1,0 +1,13 @@
+# Build output and local test pictures
+/target/
+/shots/
+*.tmp
+
+# The builder's working notes about the studied program stay on this computer
+/MECHANICS.md
+/mechanics.json
+
+# Program files go in GitHub releases, not in the source code
+/release/
+/dist/*.zip
+/dist/Hearth/Hearth.exe

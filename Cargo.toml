@@ -1,0 +1,32 @@
+[package]
+name = "hearth"
+version = "0.2.2"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+egui = { version = "0.37", features = ["monochrome_emoji_fonts"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+xcap = "0.9.10"
+nokhwa = { version = "0.10.11", default-features = false, features = ["input-native"] }
+cpal = "0.18.2"
+nnnoiseless = { version = "0.5.2", default-features = false }
+ureq = { version = "3.5.2", default-features = false, features = ["native-tls", "gzip"] }
+zip = { version = "9.6.0", default-features = false, features = ["deflate"] }
+sha2 = "0.11.1"
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
+fast_image_resize = "6.1.0"
+
+[profile.release]
+opt-level = 2
+
+# Test builds (started from the build folder) must still process sound in real time:
+# unoptimised noise suppression is far too slow and made Windows drop microphone sound.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
