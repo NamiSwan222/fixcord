@@ -208,17 +208,84 @@ struct Pipe {
     repaint: Option<egui::Context>,
 }
 
+/// Which stream a viewer wants: one byte sent right after connecting.
+pub fn kind_byte(s: Source) -> u8 {
+    match s {
+        Source::Screen => b'S',
+        Source::Camera => b'C',
+    }
+}
+
+type Slot = (Arc<Mutex<Shared>>, Arc<AtomicU64>, Arc<AtomicBool>);
+
+/// One TCP port (the fixed home-network port) for every stream on this computer.
+#[derive(Clone)]
+pub struct StreamServer {
+    pub port: u16,
+    slots: Arc<Mutex<std::collections::HashMap<u8, Slot>>>,
+}
+
+impl StreamServer {
+    pub fn start(port: u16) -> Option<StreamServer> {
+        let listener = TcpListener::bind(("0.0.0.0", port)).ok()?;
+        let server = StreamServer { port, slots: Arc::new(Mutex::new(std::collections::HashMap::new())) };
+        let slots = server.slots.clone();
+        std::thread::Builder::new()
+            .name("hearth-streams".into())
+            .spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let slots = slots.clone();
+                    std::thread::spawn(move || {
+                        let mut stream = stream;
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                        let mut k = [0u8; 1];
+                        let wanted = stream.read_exact(&mut k).ok().map(|_| k[0]);
+                        let slot = {
+                            let s = slots.lock().unwrap();
+                            match wanted {
+                                Some(b) => s.get(&b).cloned(),
+                                // Older Hearth sends nothing: give it the only stream, if there is one.
+                                None if s.len() == 1 => s.values().next().cloned(),
+                                None => None,
+                            }
+                        };
+                        if let Some((sh, ct, st)) = slot {
+                            send_to_viewer(stream, sh, ct, st);
+                        }
+                    });
+                }
+            })
+            .ok()?;
+        Some(server)
+    }
+
+    fn register(&self, kind: u8, slot: Slot) {
+        self.slots.lock().unwrap().insert(kind, slot);
+    }
+
+    fn unregister(&self, kind: u8) {
+        self.slots.lock().unwrap().remove(&kind);
+    }
+}
+
 pub struct Capture {
     pub source: Source,
     pub what: What,
     pub label: String,
     pub port: u16,
     pipe: Pipe,
+    server: Option<StreamServer>,
 }
 
 impl Capture {
     /// `repaint` lets the window redraw as soon as a new picture is ready.
-    pub fn start(what: What, label: String, settings: StreamSettings, repaint: Option<egui::Context>) -> Capture {
+    pub fn start(
+        what: What,
+        label: String,
+        settings: StreamSettings,
+        repaint: Option<egui::Context>,
+        server: Option<StreamServer>,
+    ) -> Capture {
         let pipe = Pipe {
             shared: Arc::new(Mutex::new(Shared::default())),
             counter: Arc::new(AtomicU64::new(0)),
@@ -229,8 +296,12 @@ impl Capture {
             repaint,
         };
 
-        // Server for viewers on the home network.
-        let port = match TcpListener::bind(("0.0.0.0", 0)) {
+        // Viewers connect to the shared stream port; without it, to a port of this capture's own.
+        let port = if let Some(srv) = &server {
+            srv.register(kind_byte(what.source()), (pipe.shared.clone(), pipe.jpeg_counter.clone(), pipe.stop.clone()));
+            srv.port
+        } else {
+            match TcpListener::bind(("0.0.0.0", 0)) {
             Ok(listener) => {
                 let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
                 let _ = listener.set_nonblocking(true);
@@ -241,6 +312,7 @@ impl Capture {
             Err(e) => {
                 pipe.shared.lock().unwrap().error = Some(format!("Couldn't open a port for viewers: {e}"));
                 0
+            }
             }
         };
 
@@ -261,7 +333,7 @@ impl Capture {
                 })
                 .ok();
         }
-        Capture { source: what.source(), what, label, port, pipe }
+        Capture { source: what.source(), what, label, port, pipe, server }
     }
 
     pub fn settings(&self) -> StreamSettings {
@@ -290,6 +362,9 @@ impl Drop for Capture {
     fn drop(&mut self) {
         self.pipe.stop.store(true, Ordering::Relaxed);
         self.pipe.mailbox.1.notify_all();
+        if let Some(srv) = &self.server {
+            srv.unregister(kind_byte(self.source));
+        }
     }
 }
 
@@ -588,7 +663,8 @@ pub struct Viewer {
 
 impl Viewer {
     /// `repaint` lets the window redraw the moment a picture arrives.
-    pub fn start(ip: IpAddr, port: u16, repaint: Option<egui::Context>) -> Viewer {
+    /// `kind`: which stream to ask for on a shared stream port (see `kind_byte`).
+    pub fn start(ip: IpAddr, port: u16, kind: Option<u8>, repaint: Option<egui::Context>) -> Viewer {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let counter = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -603,6 +679,9 @@ impl Viewer {
                 }
             };
             let _ = stream.set_nodelay(true);
+            if let Some(k) = kind {
+                let _ = stream.write_all(&[k]);
+            }
             let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
             let mut meter = FpsMeter::new();
             let mut len = [0u8; 4];
@@ -694,7 +773,7 @@ mod tests {
         let pic = Picture { width: w as usize, height: h as usize, rgba: Arc::new(px) };
         store_jpeg(&shared, &counter, encode_jpeg(&pic, medium.jpeg_quality()).unwrap());
 
-        let viewer = Viewer::start("127.0.0.1".parse().unwrap(), port, None);
+        let viewer = Viewer::start("127.0.0.1".parse().unwrap(), port, None, None);
         let t = Instant::now();
         while viewer.picture().is_none() && t.elapsed() < Duration::from_secs(5) {
             std::thread::sleep(Duration::from_millis(20));

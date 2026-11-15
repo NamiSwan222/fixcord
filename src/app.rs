@@ -1,10 +1,15 @@
 //! Hearth: the window, its panels and all the interaction.
 
+use crate::accounts;
 use crate::audio::{self, Audio, Sfx};
 use crate::media::{self, Capture, Choice, Source, StreamSettings, Viewer, What};
 use crate::model::*;
-use crate::net::{Lan, Packet, StreamAd};
+use crate::net::{self, Lan, Packet, StreamAd};
 mod activities;
+mod arena_view;
+mod avatars;
+mod login;
+use sha2::{Digest, Sha256};
 use activities::{GameInvite, GameSession};
 use crate::snake::{self, Board, Dir as SnakeDir, Phase as SnakePhase};
 use crate::theme::{self, Palette};
@@ -113,6 +118,12 @@ pub struct ScreenshotJob {
 
 pub struct HearthApp {
     data: Data,
+    /// An account is signed in (otherwise the sign-in screen shows).
+    signed_in: bool,
+    store: Option<accounts::Store>,
+    login: LoginForm,
+    /// Home-network friends: their Hearth's session id → their stable user id (from their account).
+    peer_uid: HashMap<u64, Id>,
     community: Option<Id>, // None = home
     channel_for: HashMap<Id, Id>,
     dm: Option<Id>,
@@ -155,6 +166,26 @@ pub struct HearthApp {
     attention: bool,
     /// Lets streaming threads ask for a redraw the moment a picture arrives.
     egui_ctx: Option<egui::Context>,
+    /// One port for every stream this computer shares.
+    stream_server: Option<media::StreamServer>,
+    /// Home-network messages already shown (each arrives once per network adapter).
+    seen_says: HashSet<(u64, u64)>,
+    // Profile pictures
+    avatar_pick: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
+    avatar_note: Option<String>,
+    avatar_tex: HashMap<(Id, u64), egui::TextureHandle>,
+    avatar_asked: HashMap<Id, f64>,
+    avatar_sent_at: f64,
+    // Arena (3D game)
+    arena: Option<arena_view::ArenaSession>,
+    arena_invites: HashMap<u64, arena_view::ArenaInvite>,
+    show_arena: bool,
+    mouse_captured: bool,
+    new_peer_ip: String,
+    /// Arena games on the network: game id → the host's session id.
+    arena_hosts: HashMap<u64, u64>,
+    /// Push-to-talk key was down last frame (for its click sounds).
+    ptt_was: bool,
     // Activities (games)
     game: Option<GameSession>,
     game_invites: HashMap<u64, GameInvite>,
@@ -229,20 +260,47 @@ fn now_secs() -> i64 {
     Local::now().timestamp()
 }
 
-fn state_path() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("HOME"))?;
-    Some(std::path::PathBuf::from(base).join("Hearth").join("state.json"))
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum LoginMode {
+    #[default]
+    Choose,
+    Create,
+    Pin(u64),
+}
+
+/// The sign-in screen's state.
+#[derive(Default)]
+struct LoginForm {
+    mode: LoginMode,
+    accounts: Vec<accounts::AccountSummary>,
+    has_legacy: bool,
+    name: String,
+    username: String,
+    hue: u8,
+    pin: String,
+    pin2: String,
+    keep_signed_in: bool,
+    bring_over: bool,
+    error: Option<String>,
 }
 
 impl HearthApp {
     pub fn new(screenshot: Option<ScreenshotJob>) -> Self {
         let demo = screenshot.is_some();
-        let save_path = if demo { None } else { state_path() };
-        let data = save_path
-            .as_ref()
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| serde_json::from_slice::<Data>(&b).ok())
-            .unwrap_or_else(|| sample(now_secs(), "You"));
+        // Accounts: sign the remembered account in straight away; otherwise show the sign-in
+        // screen (with placeholder data that is never saved).
+        let store = if demo { None } else { accounts::Store::open() };
+        let remembered = store.as_ref().and_then(|s| s.remembered().and_then(|id| s.load(id).map(|d| (id, d))));
+        let (data, save_path, signed_in) = match (&store, remembered) {
+            (Some(s), Some((id, d))) if d.account.pin_hash.is_none() => (d, Some(s.path_for(id)), true),
+            _ => {
+                let mut d = sample(now_secs(), "You");
+                if demo {
+                    d.account = Account { id: 1, username: "you".into(), created: 0, pin_hash: None, pin_salt: 0 };
+                }
+                (d, None, demo)
+            }
+        };
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -250,6 +308,10 @@ impl HearthApp {
             | 1;
         let mut app = HearthApp {
             data,
+            signed_in,
+            store,
+            login: LoginForm::default(),
+            peer_uid: HashMap::new(),
             community: Some(101),
             channel_for: HashMap::new(),
             dm: None,
@@ -291,6 +353,20 @@ impl HearthApp {
             applied_on_top: None,
             attention: false,
             egui_ctx: None,
+            stream_server: None,
+            seen_says: HashSet::new(),
+            avatar_pick: None,
+            avatar_note: None,
+            avatar_tex: HashMap::new(),
+            avatar_asked: HashMap::new(),
+            avatar_sent_at: -100.0,
+            arena: None,
+            arena_invites: HashMap::new(),
+            show_arena: false,
+            mouse_captured: false,
+            new_peer_ip: String::new(),
+            arena_hosts: HashMap::new(),
+            ptt_was: false,
             game: None,
             game_invites: HashMap::new(),
             hidden_invites: HashSet::new(),
@@ -327,6 +403,33 @@ impl HearthApp {
             // A previous update leaves the old program behind; tidy it up.
             update::cleanup_after_update();
         }
+        app.prepare_data();
+        if app.data.settings.skip_splash {
+            app.splash_until = 0.0;
+        }
+        if !app.signed_in {
+            app.refresh_login();
+        }
+        // Test aid: HEARTH_OPEN=… opens a settings page or screen.
+        if let Ok(page) = std::env::var("HEARTH_OPEN") {
+            if page == "login" {
+                app.signed_in = false;
+                app.refresh_login();
+                app.login.mode = LoginMode::Create;
+            }
+            app.test_aid(&page);
+        }
+        if !demo && app.signed_in && app.data.settings.lan_enabled {
+            app.start_lan();
+        }
+        app.mark_read();
+        app
+    }
+
+    /// Tidy up loaded data: fixes for saves from older versions, and a fresh start for the
+    /// session (nobody in voice, home-network friends offline until they say hello).
+    fn prepare_data(&mut self) {
+        let app = self;
         // Nobody is in a voice channel when the app starts.
         for c in app.data.communities.iter_mut() {
             for ch in c.channels.iter_mut() {
@@ -377,12 +480,31 @@ impl HearthApp {
         for u in app.data.users.iter_mut().filter(|u| u.id >= 1_000_000) {
             u.status = Status::Hidden;
         }
-        if app.data.settings.skip_splash {
-            app.splash_until = 0.0;
+        // Before accounts, every start of a friend's Hearth looked like a new person. Drop those
+        // leftovers unless something still points at them (a message, a conversation, a friend).
+        let referenced: HashSet<Id> = app
+            .data
+            .communities
+            .iter()
+            .flat_map(|c| c.channels.iter())
+            .flat_map(|ch| ch.messages.iter().map(|m| m.author))
+            .chain(app.data.dms.iter().map(|d| d.with))
+            .collect();
+        let before = app.data.users.len();
+        app.data.users.retain(|u| u.id < 1_000_000 || u.friend || referenced.contains(&u.id));
+        if let Some(c) = app.data.community_mut(HOME_NET_COMMUNITY) {
+            c.members.retain(|id| *id < 1_000_000);
         }
-        // Test aid: HEARTH_OPEN=chat|notifications|accessibility|privacy|shortcuts opens that settings page.
-        if let Ok(page) = std::env::var("HEARTH_OPEN") {
-            let pg = match page.as_str() {
+        if app.data.users.len() != before {
+            app.dirty = true;
+        }
+    }
+
+    /// Test aid: open a page or screen for a picture.
+    fn test_aid(&mut self, page: &str) {
+        let app = self;
+        {
+            let pg = match page {
                 "account" => Some(SettingsPage::Account),
                 "appearance" => Some(SettingsPage::Appearance),
                 "chat" => Some(SettingsPage::Chat),
@@ -393,6 +515,7 @@ impl HearthApp {
                 "share" => Some(SettingsPage::Share),
                 "voice" => Some(SettingsPage::Voice),
                 "updates" => Some(SettingsPage::Updates),
+                "network" => Some(SettingsPage::Network),
                 _ => None,
             };
             if let Some(pg) = pg {
@@ -405,6 +528,9 @@ impl HearthApp {
             }
             if page == "activities" {
                 app.activities_open = true;
+            }
+            if page == "arena" {
+                app.preview_arena();
             }
             if page == "stage" || page == "golive" {
                 let room = app
@@ -420,11 +546,6 @@ impl HearthApp {
                 }
             }
         }
-        if !demo && app.data.settings.lan_enabled {
-            app.start_lan();
-        }
-        app.mark_read();
-        app
     }
 
     /// Window-level settings that are applied once when they change.
@@ -460,8 +581,21 @@ impl HearthApp {
     }
 
     fn start_lan(&mut self) {
-        match Lan::start(self.data.settings.lan_port, self.instance) {
+        // Everything on the one fixed port: chat, presence, games and voice over UDP, and
+        // screen/camera streams over TCP on the same port number.
+        match Lan::start(net::PORT, self.instance, Some(self.audio.voice_sink())) {
             Ok(l) => {
+                if let Some(sock) = l.socket() {
+                    self.audio.use_socket(sock, net::PORT);
+                }
+                for ip in self.data.settings.manual_peers.clone() {
+                    if let Ok(ip) = ip.parse() {
+                        l.add_address(ip);
+                    }
+                }
+                if self.stream_server.is_none() {
+                    self.stream_server = media::StreamServer::start(net::PORT);
+                }
                 self.lan = Some(l);
                 self.lan_error = None;
                 self.last_hello = -100.0;
@@ -603,6 +737,7 @@ impl HearthApp {
         if let Some(list) = self.messages_mut(target) {
             list.push(m);
         }
+        self.sfx(Sfx::Sent);
         self.composer.clear();
         self.dirty = true;
         self.jump_to = None;
@@ -612,7 +747,7 @@ impl HearthApp {
                 let channel = self.channel_name(c, ch);
                 let name = self.data.me().name.clone();
                 if let Some(lan) = &self.lan {
-                    lan.send(&Packet::Say { from: self.instance, name, channel, text, id });
+                    lan.send(&Packet::Say { from: self.instance, name, channel, text, id, account: self.data.account.id });
                 }
                 return;
             }
@@ -810,6 +945,8 @@ impl HearthApp {
                     voice,
                     streams,
                     voice_port: self.audio.voice_port,
+                    account: self.data.account.id,
+                    avatar: self.data.me().avatar_hash,
                 });
                 self.last_hello = now;
             }
@@ -822,7 +959,7 @@ impl HearthApp {
         let stale: Vec<u64> = self.lan_seen.iter().filter(|(_, t)| now - **t > 12.0).map(|(k, _)| *k).collect();
         for k in stale {
             self.lan_seen.remove(&k);
-            let uid = peer_user_id(k);
+            let uid = self.peer_uid.remove(&k).unwrap_or_else(|| peer_user_id(k));
             self.peers.remove(&uid);
             if let Some(u) = self.data.user_mut(uid) {
                 u.status = Status::Hidden;
@@ -830,6 +967,7 @@ impl HearthApp {
         }
         self.sync_lan_voice();
         self.tick_game(now);
+        self.tick_arena(now);
     }
 
     /// Put home-network peers into the Home Network voice channel they say they're in,
@@ -866,7 +1004,8 @@ impl HearthApp {
         self.viewers.retain(|k, _| wanted.iter().any(|(w, _, _)| w == k));
         for (key, ip, port) in wanted {
             let repaint = self.egui_ctx.clone();
-            self.viewers.entry(key).or_insert_with(|| Viewer::start(ip, port, repaint));
+            let kind = Some(media::kind_byte(key.1));
+            self.viewers.entry(key).or_insert_with(|| Viewer::start(ip, port, kind, repaint));
         }
 
         // Voice: talk with (and only accept voices from) the people in our Home Network voice channel.
@@ -1098,6 +1237,10 @@ impl HearthApp {
         let s = self.data.settings.clone();
         let ptt_key = egui::Key::from_name(&s.ptt_key);
         let ptt_held = !self.recording_ptt && self.window_focused && ptt_key.map(|k| ctx.input(|i| i.key_down(k))).unwrap_or(false);
+        if s.push_to_talk && self.voice.is_some() && ptt_held != self.ptt_was {
+            self.sfx(if ptt_held { Sfx::PttOn } else { Sfx::PttOff });
+        }
+        self.ptt_was = ptt_held;
         self.audio.set_controls(
             s.input_volume,
             s.output_volume,
@@ -1124,14 +1267,30 @@ impl HearthApp {
     fn on_packet(&mut self, p: Packet, ip: std::net::IpAddr, now: f64) {
         let (from, name) = match &p {
             Packet::Hello { from, name, .. } | Packet::Say { from, name, .. } => (*from, name.clone()),
+            Packet::Avatar { .. } | Packet::AvatarAsk { .. } => {
+                self.on_avatar_packet(p);
+                return;
+            }
+            Packet::ArenaMatch { .. } | Packet::ArenaPlayer { .. } | Packet::ArenaShot { .. } | Packet::ArenaDown { .. } | Packet::ArenaLeave { .. } => {
+                self.on_arena_packet(p, now);
+                return;
+            }
             _ => {
                 self.on_game_packet(p, now);
                 return;
             }
         };
         let name: String = name.chars().take(32).collect();
-        let uid = peer_user_id(from);
+        // Friends are recognised by their account, so they stay the same person across restarts.
+        let uid = match &p {
+            Packet::Hello { account, .. } | Packet::Say { account, .. } if *account != 0 => peer_user_id(*account),
+            _ => self.peer_uid.get(&from).copied().unwrap_or_else(|| peer_user_id(from)),
+        };
+        self.peer_uid.insert(from, uid);
         self.lan_seen.insert(from, now);
+        if let Packet::Hello { account, avatar, .. } = &p {
+            self.want_avatar(uid, *account, *avatar);
+        }
         if let Packet::Hello { voice, streams, voice_port, .. } = &p {
             let mut list: Vec<(Source, u16)> = streams
                 .iter()
@@ -1173,6 +1332,8 @@ impl HearthApp {
                     friend: false,
                     pending_in: false,
                     pending_out: false,
+                    avatar: None,
+                    avatar_hash: 0,
                 });
             }
         }
@@ -1181,7 +1342,11 @@ impl HearthApp {
                 c.members.push(uid);
             }
         }
-        if let Packet::Say { channel, text, .. } = p {
+        if let Packet::Say { channel, text, id: msg_id, .. } = p {
+            // Each message arrives once per network adapter: keep the first.
+            if !self.seen_says.insert((from, msg_id)) {
+                return;
+            }
             let channel: String = channel.chars().take(40).collect();
             let existing = self
                 .data
@@ -1277,6 +1442,14 @@ fn initials(name: &str) -> String {
 fn paint_avatar(ui: &Ui, center: Pos2, size: f32, name: &str, hue: u8, status: Option<Status>, ring_bg: Color32) {
     let p = ui.painter();
     let r = size / 2.0;
+    if let Some(tex) = avatars::avatar_texture(name, hue) {
+        // Their own picture, in a circle.
+        let rect = Rect::from_center_size(center, vec2(size, size));
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        p.add(egui::epaint::RectShape::filled(rect, CornerRadius::same(r.min(255.0) as u8), Color32::WHITE).with_texture(tex, uv));
+        paint_status_dot(p, center, size, status, ring_bg);
+        return;
+    }
     p.circle_filled(center, r, theme::hue(hue));
     p.circle_filled(center + vec2(-r * 0.25, -r * 0.3), r * 0.55, Color32::from_white_alpha(14));
     p.text(
@@ -1286,6 +1459,12 @@ fn paint_avatar(ui: &Ui, center: Pos2, size: f32, name: &str, hue: u8, status: O
         FontId::proportional(size * 0.45),
         Color32::WHITE,
     );
+    paint_status_dot(p, center, size, status, ring_bg);
+}
+
+/// The little online/away/busy dot on an avatar's corner.
+fn paint_status_dot(p: &egui::Painter, center: Pos2, size: f32, status: Option<Status>, ring_bg: Color32) {
+    let r = size / 2.0;
     if let Some(s) = status {
         let dot = (size * 0.17).max(4.0);
         let c = center + vec2(r * 0.72, r * 0.72);
@@ -1613,6 +1792,10 @@ impl eframe::App for HearthApp {
             self.view_changed_at = now; // the app fades in when the start-up screen ends
             return;
         }
+        if !self.signed_in {
+            self.login_screen(ui, &p);
+            return;
+        }
         self.update_banner(&ctx, &p);
 
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
@@ -1640,8 +1823,14 @@ impl eframe::App for HearthApp {
 
         self.rail(ui, &p);
         self.sidebar(ui, &p, now);
+        self.update_avatars(&ctx);
         self.game_toast(&ctx, &p);
         self.activities_dialog(&ctx, &p);
+        if self.show_arena && self.arena.is_some() {
+            self.arena_view(ui, &p, now);
+            self.popups(&ctx, &p);
+            return;
+        }
         if self.show_game && self.game.is_some() {
             self.game_view(ui, &p, now);
             self.popups(&ctx, &p);
@@ -2585,7 +2774,7 @@ impl HearthApp {
             // Same thing, new quality or frame rate: change it without stopping.
             Some(cap) if cap.what == what => cap.set_settings(settings),
             _ => {
-                *slot = Some(Capture::start(what, label, settings, self.egui_ctx.clone()));
+                *slot = Some(Capture::start(what, label, settings, self.egui_ctx.clone(), self.stream_server.clone()));
                 self.textures.remove(&format!("me-{}", g.source.tag()));
                 self.last_hello = -100.0;
                 self.sfx(Sfx::LiveStart);
@@ -4063,12 +4252,20 @@ impl HearthApp {
             let mut msg = false;
             let mut set_status: Option<Status> = None;
             let mut friend = false;
+            let mut close_card = false;
             let resp = egui::Area::new(EId::new("profile_card")).order(egui::Order::Foreground).fixed_pos(pos + rise).show(ctx, |ui| {
                 ui.multiply_opacity(pop_t);
                 Frame::new().fill(p.raised).corner_radius(12.0).stroke(Stroke::new(1.0, p.divider)).shadow(shadow(90)).show(ui, |ui| {
                     ui.set_width(284.0);
                     let (banner, _) = ui.allocate_exact_size(vec2(284.0, 64.0), Sense::hover());
                     ui.painter().rect_filled(banner, CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 }, theme::hue(u.hue));
+                    let xr = Rect::from_center_size(banner.right_top() + vec2(-18.0, 18.0), vec2(26.0, 26.0));
+                    let xresp = ui.interact(xr, EId::new("profile_close"), Sense::click());
+                    ui.painter().circle_filled(xr.center(), 13.0, Color32::from_black_alpha(if xresp.hovered() { 140 } else { 90 }));
+                    ui.painter().text(xr.center(), Align2::CENTER_CENTER, "×", FontId::proportional(16.0), Color32::WHITE);
+                    if xresp.on_hover_text("Close").clicked() {
+                        close_card = true;
+                    }
                     let ac = banner.left_bottom() + vec2(50.0, 4.0);
                     ui.painter().circle_filled(ac, 40.0, p.raised);
                     paint_avatar(ui, ac, 72.0, &u.name, u.hue, Some(u.status), p.raised);
@@ -4124,7 +4321,9 @@ impl HearthApp {
                     u.pending_in = false;
                 }
                 self.dirty = true;
-            } else if pressed_outside(resp.response.rect) && ctx.input(|i| i.pointer.press_start_time()).map(|t| t < ctx.input(|i| i.time) - 0.05).unwrap_or(true) {
+            } else if close_card || (pressed_outside(resp.response.rect) && self.now - self.popup_opened_at > 0.15) {
+                // A click anywhere outside the card (or its × button) closes it. The short wait
+                // ignores the very click that opened it.
                 self.profile = None;
             }
         }
@@ -4444,6 +4643,18 @@ impl HearthApp {
             _ => ("Off".into(), p.faint),
         };
         let save_path = self.save_path.as_ref().map(|p| p.display().to_string());
+        // My account / Home network page details
+        let account = self.data.account.clone();
+        let has_avatar = self.data.me().avatar.is_some();
+        let avatar_note = self.avatar_note.clone();
+        let picking = self.avatar_pick.is_some();
+        let my_addresses: Vec<String> = if page == SettingsPage::Network { net::local_addresses().iter().map(|(ip, _)| ip.to_string()).collect() } else { vec![] };
+        let mut pick_picture = false;
+        let mut remove_picture = false;
+        let mut sign_out = false;
+        let mut add_address: Option<String> = None;
+        let mut remove_address: Option<String> = None;
+        let mut address_error: Option<String> = None;
         let view_t = self.ease(self.view_changed_at, 0.25);
         let slide = ((1.0 - view_t) * 28.0) as i8;
         egui::CentralPanel::default()
@@ -4516,6 +4727,44 @@ impl HearthApp {
                                             });
                                         });
                                     }
+                                    ui.add_space(12.0);
+                                    Frame::new().fill(p.side).corner_radius(12.0).inner_margin(16.0).show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        section_label(ui, "Profile picture", p);
+                                        ui.horizontal(|ui| {
+                                            let label = if picking { "Choosing…" } else if has_avatar { "Change picture" } else { "Upload a picture" };
+                                            if pill_button(ui, label, p.accent, p.on_accent).clicked() && !picking {
+                                                pick_picture = true;
+                                            }
+                                            if has_avatar && ui.add(egui::Button::new(RichText::new("Remove").color(p.muted)).frame(false)).clicked() {
+                                                remove_picture = true;
+                                            }
+                                        });
+                                        ui.label(RichText::new("PNG, JPEG, GIF, BMP or WebP. It's cropped to a square and friends on your network see it.").size(12.0).color(p.faint));
+                                        if let Some(n) = &avatar_note {
+                                            ui.label(RichText::new(n).size(12.5).color(p.danger));
+                                        }
+                                    });
+                                    ui.add_space(12.0);
+                                    Frame::new().fill(p.side).corner_radius(12.0).inner_margin(16.0).show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        section_label(ui, "Account", p);
+                                        ui.label(RichText::new(format!("@{}", account.username)).size(16.0).color(p.strong));
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "Account ID {:016x}{}",
+                                                account.id,
+                                                if account.pin_hash.is_some() { " · protected with a PIN" } else { "" }
+                                            ))
+                                            .size(12.0)
+                                            .color(p.faint),
+                                        );
+                                        ui.label(RichText::new("Friends recognise you by this ID, so you stay the same person every time Hearth starts.").size(12.0).color(p.muted));
+                                        ui.add_space(8.0);
+                                        if ui.add(egui::Button::new(RichText::new("Sign out / switch account").color(p.danger)).fill(p.input)).clicked() {
+                                            sign_out = true;
+                                        }
+                                    });
                                 }
                                 SettingsPage::Appearance => {
                                     ui.label(RichText::new("Appearance").size(22.0).color(p.strong).strong());
@@ -4843,6 +5092,12 @@ impl HearthApp {
                                     section_label(ui, "Window", p);
                                     ui.checkbox(&mut s.always_on_top, "Keep Hearth on top of other windows");
                                     ui.checkbox(&mut s.skip_splash, "Skip the start-up screen");
+                                    ui.add_space(10.0);
+                                    section_label(ui, "Games", p);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Arena mouse speed");
+                                        ui.add(egui::Slider::new(&mut s.mouse_sensitivity, 0.2..=3.0).step_by(0.1).suffix("×"));
+                                    });
                                 }
                                 SettingsPage::Privacy => {
                                     ui.label(RichText::new("Privacy").size(22.0).color(p.strong).strong());
@@ -4925,18 +5180,53 @@ impl HearthApp {
                                     if ui.checkbox(&mut s.lan_enabled, "Share the Home Network community").changed() {
                                         restart_lan = true;
                                     }
-                                    ui.horizontal(|ui| {
-                                        ui.label("Port");
-                                        let mut port = s.lan_port as u32;
-                                        if ui.add(egui::DragValue::new(&mut port).range(1024..=65535)).changed() {
-                                            s.lan_port = port as u16;
-                                        }
-                                        if ui.button("Apply").clicked() {
-                                            restart_lan = true;
-                                        }
-                                    });
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "Everyone uses the same port, {}, for chat, voice, video and games, so friends always find each other.",
+                                            net::PORT
+                                        ))
+                                        .size(12.5)
+                                        .color(p.muted),
+                                    );
                                     ui.add_space(8.0);
                                     ui.label(RichText::new(&lan_status.0).color(lan_status.1));
+                                    ui.add_space(12.0);
+                                    section_label(ui, "This computer's address", p);
+                                    if my_addresses.is_empty() {
+                                        ui.label(RichText::new("Not connected to a network.").color(p.faint));
+                                    }
+                                    for a in &my_addresses {
+                                        ui.label(RichText::new(a).size(15.0).color(p.strong));
+                                    }
+                                    ui.add_space(12.0);
+                                    section_label(ui, "Friends' computers added by address", p);
+                                    ui.label(
+                                        RichText::new("Hearth finds friends by itself. If a friend doesn't show up (some routers block it), ask them for their address above and add it here.")
+                                            .size(12.0)
+                                            .color(p.faint),
+                                    );
+                                    for a in s.manual_peers.clone() {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(&a).color(p.text));
+                                            if ui.small_button("Remove").clicked() {
+                                                remove_address = Some(a.clone());
+                                            }
+                                        });
+                                    }
+                                    ui.horizontal(|ui| {
+                                        let r = ui.add(egui::TextEdit::singleline(&mut self.new_peer_ip).hint_text("192.168.1.23").desired_width(180.0).background_color(p.raised));
+                                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                                        if ui.button("Add").clicked() || enter {
+                                            let t = self.new_peer_ip.trim().to_string();
+                                            match t.parse::<std::net::IpAddr>() {
+                                                Ok(_) => add_address = Some(t),
+                                                Err(_) => address_error = Some("That isn't an address like 192.168.1.23.".into()),
+                                            }
+                                        }
+                                    });
+                                    if let Some(e) = &address_error {
+                                        ui.label(RichText::new(e).size(12.0).color(p.danger));
+                                    }
                                     ui.add_space(8.0);
                                     ui.label(RichText::new("Your firewall may ask about Hearth the first time; allow it on private networks.").size(12.5).color(p.faint));
                                 }
@@ -5047,6 +5337,30 @@ impl HearthApp {
         if toggle_mic_test {
             self.mic_test = !self.mic_test;
         }
+        if pick_picture {
+            self.pick_avatar();
+        }
+        if remove_picture {
+            self.remove_avatar();
+        }
+        if let Some(a) = add_address {
+            if !self.data.settings.manual_peers.contains(&a) {
+                self.data.settings.manual_peers.push(a.clone());
+            }
+            if let (Some(l), Ok(ip)) = (&self.lan, a.parse()) {
+                l.add_address(ip);
+            }
+            self.new_peer_ip.clear();
+            self.dirty = true;
+        }
+        if let Some(a) = remove_address {
+            self.data.settings.manual_peers.retain(|x| *x != a);
+            restart_lan = true;
+        }
+        if sign_out {
+            self.sign_out();
+            return;
+        }
         if check_updates {
             self.update_failed = None;
             self.last_update_check = self.now;
@@ -5081,8 +5395,17 @@ impl HearthApp {
         if reset {
             let name = self.data.me().name.clone();
             let settings = self.data.settings.clone();
+            let account = self.data.account.clone();
+            let (avatar, avatar_hash, hue) = (self.data.me().avatar.clone(), self.data.me().avatar_hash, self.data.me().hue);
             self.data = sample(now_secs(), &name);
             self.data.settings = settings;
+            // Resetting clears messages and people, never who you are.
+            self.data.account = account;
+            if let Some(me) = self.data.user_mut(ME) {
+                me.avatar = avatar;
+                me.avatar_hash = avatar_hash;
+                me.hue = hue;
+            }
             self.leave_voice();
             self.pending.clear();
             self.channel_for.clear();

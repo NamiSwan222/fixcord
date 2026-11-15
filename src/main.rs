@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod app;
+mod arena;
 mod audio;
 mod media;
 mod model;

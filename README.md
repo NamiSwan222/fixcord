@@ -7,7 +7,9 @@ A small chat app for friends on the same home network, written in Rust with egui
   push to talk, echo reduction and per-friend volume.
 - **Video and screen sharing**: camera, a whole screen or one app window, with quality and frame-rate
   choices.
-- **Activities**: multiplayer Snake (1–8 players) on the home network.
+- **Accounts** with a stable identity, optional PIN and **profile pictures**.
+- **Activities**: multiplayer Snake and **Arena**, a 3D tag game for up to 8 players, on the home network.
+- One fixed port (47615) for everything; friends can also be added by address.
 - Noise suppression with **DeepFilterNet** (neural network) or RNNoise (lighter).
 - Friends and direct messages, replies, reactions, pins, search, themes, interface sounds and
   animations.

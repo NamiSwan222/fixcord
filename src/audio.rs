@@ -67,6 +67,16 @@ pub enum Sfx {
     Undeafen,
     LiveStart,
     LiveStop,
+    /// A message of yours went out.
+    Sent,
+    /// Push to talk: key down / key up.
+    PttOn,
+    PttOff,
+    /// Arena: firing, hitting someone, tagging someone out, being hit.
+    Shoot,
+    Hit,
+    Tagged,
+    Hurt,
 }
 
 #[derive(Default)]
@@ -177,8 +187,74 @@ fn tone(out: &mut Vec<f32>, start_s: f32, freq: f32, len_s: f32, amp: f32) {
     }
 }
 
+/// A falling or rising sweep with a bit of noise (for the game's blaster and hits).
+fn sweep(out: &mut Vec<f32>, start_s: f32, f0: f32, f1: f32, len_s: f32, amp: f32, noise: f32) {
+    let start = (start_s * RATE as f32) as usize;
+    let len = (len_s * RATE as f32) as usize;
+    if out.len() < start + len {
+        out.resize(start + len, 0.0);
+    }
+    let mut phase = 0.0f32;
+    let mut seed: u32 = 0x1234_5678;
+    for i in 0..len {
+        let t = i as f32 / len as f32;
+        let f = f0 + (f1 - f0) * t;
+        phase += 2.0 * std::f32::consts::PI * f / RATE as f32;
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let n = (seed >> 9) as f32 / (1u32 << 23) as f32 - 1.0;
+        let env = (t / 0.04).min(1.0) * (1.0 - t).powi(2);
+        out[start + i] += (phase.sin() * (1.0 - noise) + n * noise) * amp * env;
+    }
+}
+
+/// A soft echo so chimes sound fuller (the same sound again, quieter, a moment later).
+fn add_echo(v: &mut Vec<f32>, delay_s: f32, gain: f32) {
+    let d = (delay_s * RATE as f32) as usize;
+    let len = v.len();
+    v.resize(len + d, 0.0);
+    for i in (0..len).rev() {
+        let s = v[i];
+        v[i + d] += s * gain;
+    }
+}
+
 pub fn synth(s: Sfx) -> Vec<f32> {
     let mut v = vec![];
+    match s {
+        Sfx::Shoot => {
+            sweep(&mut v, 0.0, 1400.0, 300.0, 0.12, 0.28, 0.15);
+            return v;
+        }
+        Sfx::Hit => {
+            sweep(&mut v, 0.0, 1400.0, 300.0, 0.10, 0.22, 0.15);
+            tone(&mut v, 0.04, 1760.0, 0.08, 0.2);
+            return v;
+        }
+        Sfx::Tagged => {
+            for (k, f) in [880.0, 1108.7, 1318.5, 1760.0].iter().enumerate() {
+                tone(&mut v, k as f32 * 0.05, *f, 0.16, 0.17);
+            }
+            add_echo(&mut v, 0.09, 0.3);
+            return v;
+        }
+        Sfx::Hurt => {
+            sweep(&mut v, 0.0, 220.0, 110.0, 0.18, 0.3, 0.45);
+            return v;
+        }
+        Sfx::Sent => {
+            sweep(&mut v, 0.0, 500.0, 1100.0, 0.09, 0.08, 0.6);
+            return v;
+        }
+        Sfx::PttOn => {
+            tone(&mut v, 0.0, 1046.5, 0.04, 0.12);
+            return v;
+        }
+        Sfx::PttOff => {
+            tone(&mut v, 0.0, 784.0, 0.04, 0.1);
+            return v;
+        }
+        _ => {}
+    }
     // (start, frequency Hz, length s)
     let notes: &[(f32, f32, f32)] = match s {
         Sfx::Message => &[(0.0, 880.0, 0.12), (0.07, 1318.5, 0.18)],
@@ -193,9 +269,16 @@ pub fn synth(s: Sfx) -> Vec<f32> {
         Sfx::Undeafen => &[(0.0, 293.7, 0.08), (0.06, 392.0, 0.12)],
         Sfx::LiveStart => &[(0.0, 523.3, 0.1), (0.07, 659.3, 0.1), (0.14, 784.0, 0.22)],
         Sfx::LiveStop => &[(0.0, 784.0, 0.1), (0.07, 659.3, 0.1), (0.14, 523.3, 0.22)],
+        _ => &[],
     };
     for (start, freq, len) in notes {
-        tone(&mut v, *start, *freq, *len, 0.22);
+        tone(&mut v, *start, *freq, *len, 0.2);
+        // A quiet fifth above makes each note warmer.
+        tone(&mut v, *start, *freq * 1.5, *len * 0.7, 0.05);
+    }
+    // Joining, leaving and going live get a soft echo so they stand out.
+    if matches!(s, Sfx::Join | Sfx::Leave | Sfx::PeerJoin | Sfx::PeerLeave | Sfx::LiveStart | Sfx::LiveStop | Sfx::Deafen | Sfx::Undeafen) {
+        add_echo(&mut v, 0.11, 0.28);
     }
     v
 }
@@ -235,6 +318,7 @@ pub struct Audio {
     input: Option<(cpal::Stream, Option<String>)>,
     socket: Option<Arc<UdpSocket>>,
     sender: Option<Sender<Vec<u8>>>,
+    send_sock: Arc<Mutex<Option<Arc<UdpSocket>>>>,
     targets: Arc<Mutex<Vec<SocketAddr>>>,
     pub voice_port: u16,
     pub self_id: u64,
@@ -275,6 +359,7 @@ impl Audio {
             input: None,
             socket: None,
             sender: None,
+            send_sock: Arc::new(Mutex::new(None)),
             targets: Arc::new(Mutex::new(vec![])),
             voice_port: 0,
             self_id,
@@ -302,29 +387,24 @@ impl Audio {
                 let mut buf = vec![0u8; 4096];
                 loop {
                     let Ok((n, _)) = sock.recv_from(&mut buf) else { continue };
-                    if n < 15 || &buf[..3] != MAGIC {
-                        continue;
-                    }
-                    let from = u64::from_le_bytes(buf[3..11].try_into().unwrap());
-                    if !shared.allowed.lock().unwrap().contains(&from) || shared.deafened.load(Ordering::Relaxed) {
-                        continue;
-                    }
-                    let samples: Vec<f32> =
-                        buf[15..n].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
-                    push_voice(&shared, from, &samples);
+                    handle_voice_packet(&shared, &buf[..n]);
                 }
             });
         }
-        // Sending our voice to everyone in the channel
+        // Sending our voice to everyone in the channel (from whichever socket is current).
+        *self.send_sock.lock().unwrap() = Some(sock.clone());
         let (tx, rx) = channel::<Vec<u8>>();
         {
-            let sock = sock.clone();
+            let send_sock = self.send_sock.clone();
             let targets = self.targets.clone();
             std::thread::spawn(move || {
                 while let Ok(packet) = rx.recv() {
                     let list = targets.lock().unwrap().clone();
-                    for t in list {
-                        let _ = sock.send_to(&packet, t);
+                    let sock = send_sock.lock().unwrap().clone();
+                    if let Some(sock) = sock {
+                        for t in list {
+                            let _ = sock.send_to(&packet, t);
+                        }
                     }
                 }
             });
@@ -335,6 +415,22 @@ impl Audio {
 
     fn set_error(&self, e: String) {
         *self.shared.error.lock().unwrap() = Some(e);
+    }
+
+    /// Use the shared home-network socket (the one fixed port) for voice: send from it, and
+    /// tell friends to send to it.
+    pub fn use_socket(&mut self, sock: UdpSocket, port: u16) {
+        if !self.enabled {
+            return;
+        }
+        *self.send_sock.lock().unwrap() = Some(Arc::new(sock));
+        self.voice_port = port;
+    }
+
+    /// Where voice pieces arriving on the shared port are handed over.
+    pub fn voice_sink(&self) -> crate::net::VoiceSink {
+        let shared = self.shared.clone();
+        Arc::new(move |data: &[u8]| handle_voice_packet(&shared, data))
     }
 
     pub fn error(&self) -> Option<String> {
@@ -526,6 +622,19 @@ impl Audio {
         let incoming = self.shared.incoming.lock().unwrap();
         incoming.get(&id).and_then(|j| j.last_heard).map(|t| t.elapsed() < Duration::from_secs(5)).unwrap_or(false)
     }
+}
+
+/// One voice piece from the network: check who sent it, then queue it to play.
+fn handle_voice_packet(shared: &Shared, data: &[u8]) {
+    if data.len() < 15 || &data[..3] != MAGIC {
+        return;
+    }
+    let from = u64::from_le_bytes(data[3..11].try_into().unwrap());
+    if !shared.allowed.lock().unwrap().contains(&from) || shared.deafened.load(Ordering::Relaxed) {
+        return;
+    }
+    let samples: Vec<f32> = data[15..].chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
+    push_voice(shared, from, &samples);
 }
 
 fn push_voice(shared: &Shared, from: u64, samples: &[f32]) {
@@ -968,7 +1077,23 @@ mod tests {
 
     #[test]
     fn interface_sounds_are_short_and_not_too_loud() {
-        for s in [Sfx::Message, Sfx::Mention, Sfx::Join, Sfx::Leave, Sfx::PeerJoin, Sfx::Mute, Sfx::Deafen, Sfx::LiveStart] {
+        for s in [
+            Sfx::Message,
+            Sfx::Mention,
+            Sfx::Join,
+            Sfx::Leave,
+            Sfx::PeerJoin,
+            Sfx::Mute,
+            Sfx::Deafen,
+            Sfx::LiveStart,
+            Sfx::Sent,
+            Sfx::PttOn,
+            Sfx::PttOff,
+            Sfx::Shoot,
+            Sfx::Hit,
+            Sfx::Tagged,
+            Sfx::Hurt,
+        ] {
             let v = synth(s);
             assert!(!v.is_empty() && v.len() < RATE as usize, "{s:?} length");
             assert!(v.iter().all(|x| x.abs() <= 0.6), "{s:?} too loud");

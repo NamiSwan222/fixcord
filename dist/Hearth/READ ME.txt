@@ -10,7 +10,8 @@ Chat with each other
   Hearth opens in the "Home Network" community (HN, on the left). Everyone running Hearth
   on the same Wi-Fi or home network sees the messages there.
   The first time, Windows Firewall may ask about Hearth: allow it on private networks.
-  It only works on the same network, not over the internet.
+  It only works on the same network, not over the internet. Everyone uses port 47615.
+  If a friend doesn't show up, add their computer's address in Settings > Home network.
 
 Video and screen sharing
   In the Home Network community, join the "Lounge" voice channel. Press "Video" to turn
@@ -31,6 +32,9 @@ Games
   Press the game controller button in the Home Network community (or on the voice screen)
   to open Activities and start multiplayer Snake. Friends on your network get an invite.
   Steer with the arrow keys or W A S D.
+  Arena is a 3D tag game for up to 8 players: mouse to look, W A S D to move, Space to
+  jump, click to tag, Tab for scores, Esc to free the mouse. First to 15 tags or the most
+  after 5 minutes wins.
   Headphones avoid echo.
 
 Updates

@@ -266,6 +266,11 @@ impl HearthApp {
         let mut close = false;
         let mut host = false;
         let mut join: Option<u64> = None;
+        let mut host_arena = false;
+        let mut join_arena: Option<u64> = None;
+        let mut arena_list: Vec<(u64, String, u8, crate::arena::Phase)> =
+            self.arena_invites.iter().map(|(id, i)| (*id, i.host_name.clone(), i.players, i.phase)).collect();
+        arena_list.sort_by(|a, b| a.1.cmp(&b.1));
         let lan_on = self.lan.is_some();
         let mut invites: Vec<(u64, String, usize, SnakePhase)> =
             self.game_invites.iter().map(|(id, i)| (*id, i.host_name.clone(), i.players, i.phase)).collect();
@@ -317,9 +322,50 @@ impl HearthApp {
                         });
                     });
                 });
+                ui.add_space(10.0);
+                Frame::new().fill(p.side).corner_radius(12.0).inner_margin(14.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
+                        ui.painter().rect_filled(r, CornerRadius::same(14), theme::hue(4));
+                        // A little target.
+                        for (rad, col) in [(18.0, Color32::WHITE), (12.0, theme::hue(4)), (6.0, Color32::WHITE)] {
+                            ui.painter().circle_filled(r.center(), rad, col);
+                        }
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new("Arena (3D)").size(17.0).color(p.strong).strong());
+                            ui.label(
+                                RichText::new("1–8 players · Run, jump and tag friends with a blaster in a 3D yard. First to 15 tags wins.")
+                                    .size(12.5)
+                                    .color(p.muted),
+                            );
+                            ui.add_space(4.0);
+                            if lan_on && pill_button(ui, "Start a game", p.accent, p.on_accent).clicked() {
+                                host_arena = true;
+                            }
+                        });
+                    });
+                });
                 ui.add_space(14.0);
                 section_label(ui, "Games on your network", p);
-                if invites.is_empty() {
+                for (id, name, players, phase) in &arena_list {
+                    ui.horizontal(|ui| {
+                        let state = match phase {
+                            crate::arena::Phase::Lobby => "warming up",
+                            crate::arena::Phase::Playing => "playing a round",
+                            crate::arena::Phase::Over => "between rounds",
+                        };
+                        ui.label(RichText::new(format!("Arena with {name}")).color(p.strong));
+                        ui.label(RichText::new(format!("{players}/{} · {state}", crate::arena::MAX_PLAYERS)).size(12.0).color(p.muted));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if pill_button(ui, "Join", p.accent, p.on_accent).clicked() {
+                                join_arena = Some(*id);
+                            }
+                        });
+                    });
+                }
+                if invites.is_empty() && arena_list.is_empty() {
                     ui.label(RichText::new("Nobody is playing right now. Start one and friends get an invite.").size(12.5).color(p.faint));
                 }
                 for (id, name, players, phase) in &invites {
@@ -346,16 +392,18 @@ impl HearthApp {
             self.activities_open = false;
         }
         if host {
-            if self.game.is_some() {
-                self.leave_game();
-            }
+            self.leave_activities();
             self.host_snake();
         }
         if let Some(id) = join {
-            if self.game.is_some() {
-                self.leave_game();
-            }
+            self.leave_activities();
             self.join_snake(id);
+        }
+        if host_arena {
+            self.host_arena();
+        }
+        if let Some(id) = join_arena {
+            self.join_arena(id);
         }
     }
 
@@ -364,9 +412,17 @@ impl HearthApp {
         enum Toast {
             Invite(u64, String, usize, SnakePhase),
             Back,
+            Arena(u64, String, u8),
+            BackArena,
         }
-        let toast = if self.game.is_some() {
+        let mut join_arena: Option<u64> = None;
+        let mut open_arena = false;
+        let toast = if self.arena.is_some() {
+            if self.show_arena { None } else { Some(Toast::BackArena) }
+        } else if self.game.is_some() {
             if self.show_game { None } else { Some(Toast::Back) }
+        } else if let Some((id, i)) = self.arena_invites.iter().find(|(id, _)| !self.hidden_invites.contains(id)) {
+            Some(Toast::Arena(*id, i.host_name.clone(), i.players))
         } else {
             self.game_invites
                 .iter()
@@ -416,6 +472,34 @@ impl HearthApp {
                                     }
                                 });
                             }
+                            Toast::Arena(id, name, players) => {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("🎯").size(18.0));
+                                    ui.vertical(|ui| {
+                                        ui.label(RichText::new(format!("{name} started Arena (3D)")).color(p.strong).strong());
+                                        ui.label(RichText::new(format!("{players}/{} players", crate::arena::MAX_PLAYERS)).size(12.0).color(p.muted));
+                                    });
+                                });
+                                ui.horizontal(|ui| {
+                                    if pill_button(ui, "Join", p.accent, p.on_accent).clicked() {
+                                        join_arena = Some(*id);
+                                    }
+                                    if ui.add(egui::Button::new(RichText::new("Not now").color(p.muted)).frame(false)).clicked() {
+                                        hide = Some(*id);
+                                    }
+                                });
+                            }
+                            Toast::BackArena => {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("🎯").size(18.0));
+                                    ui.label(RichText::new("You're in an Arena game").color(p.strong).strong());
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if pill_button(ui, "Open", p.accent, p.on_accent).clicked() {
+                                            open_arena = true;
+                                        }
+                                    });
+                                });
+                            }
                             Toast::Back => {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("🎮").size(18.0));
@@ -438,6 +522,12 @@ impl HearthApp {
         }
         if open {
             self.show_game = true;
+        }
+        if let Some(id) = join_arena {
+            self.join_arena(id);
+        }
+        if open_arena {
+            self.show_arena = true;
         }
     }
 

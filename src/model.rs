@@ -49,6 +49,12 @@ pub struct User {
     pub friend: bool,
     pub pending_in: bool,
     pub pending_out: bool,
+    /// Profile picture: a small square JPEG, base64 (None = coloured circle with a letter).
+    #[serde(default)]
+    pub avatar: Option<String>,
+    /// Fingerprint of the picture (0 = none).
+    #[serde(default)]
+    pub avatar_hash: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -204,6 +210,10 @@ pub struct Settings {
     pub sound_mentions: bool,
     pub sound_voice: bool,
     pub sound_controls: bool,
+    /// Friends' computers added by address (for networks where broadcasts don't get through).
+    pub manual_peers: Vec<String>,
+    /// Arena: how fast the mouse turns you (1.0 = normal).
+    pub mouse_sensitivity: f32,
 }
 
 impl Default for Settings {
@@ -258,12 +268,29 @@ impl Default for Settings {
             sound_mentions: true,
             sound_voice: true,
             sound_controls: true,
+            manual_peers: vec![],
+            mouse_sensitivity: 1.0,
         }
     }
 }
 
+/// Who you are: a stable id that never changes (friends recognise you by it), a username and an
+/// optional PIN (stored only as a salted hash). id 0 = not set up yet.
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
+pub struct Account {
+    pub id: u64,
+    pub username: String,
+    pub created: i64,
+    #[serde(default)]
+    pub pin_hash: Option<String>,
+    #[serde(default)]
+    pub pin_salt: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Data {
+    #[serde(default)]
+    pub account: Account,
     pub users: Vec<User>,
     pub communities: Vec<Community>,
     pub dms: Vec<DirectThread>,
@@ -336,6 +363,8 @@ fn user(id: Id, name: &str, status: Status, hue: u8, about: &str, activity: &str
         friend,
         pending_in: false,
         pending_out: false,
+        avatar: None,
+        avatar_hash: 0,
     }
 }
 
@@ -447,6 +476,7 @@ pub fn sample(now: i64, my_name: &str) -> Data {
 
 
     let data = Data {
+        account: Account::default(),
         users,
         communities: vec![home],
         dms,

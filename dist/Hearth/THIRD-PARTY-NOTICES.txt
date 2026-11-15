@@ -42,5 +42,6 @@ Other libraries
 ---------------
 The window and drawing (egui/eframe), sound (cpal), screen capture (xcap),
 camera (nokhwa), pictures (image), networking (ureq), zip files (zip),
-checksums (sha2), dates (chrono) and data files (serde, serde_json) come from
+checksums (sha2), dates (chrono), data files (serde, serde_json), the file picker (rfd),
+network adapters (if-addrs) and picture encoding (base64, jpeg-encoder) come from
 open-source Rust libraries published under the MIT and/or Apache-2.0 licences.
