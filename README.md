@@ -7,6 +7,8 @@ A small chat app for friends on the same home network, written in Rust with egui
   push to talk, echo reduction and per-friend volume.
 - **Video and screen sharing**: camera, a whole screen or one app window, with quality and frame-rate
   choices.
+- **Activities**: multiplayer Snake (1–8 players) on the home network.
+- Noise suppression with **DeepFilterNet** (neural network) or RNNoise (lighter).
 - Friends and direct messages, replies, reactions, pins, search, themes, interface sounds and
   animations.
 - **Automatic updates** from this repository's releases.
@@ -36,5 +38,6 @@ The program is `target/release/hearth.exe`.
 
 ## Open-source parts
 
-Noise suppression uses nnnoiseless, a Rust version of RNNoise (BSD 3-Clause). Other libraries are
-MIT and/or Apache-2.0; see `dist/Hearth/THIRD-PARTY-NOTICES.txt`.
+Noise suppression uses DeepFilterNet3 through deep-filter-rt and tract (MIT/Apache-2.0), and
+nnnoiseless, a Rust version of RNNoise (BSD 3-Clause). Other libraries are MIT and/or Apache-2.0;
+see `dist/Hearth/THIRD-PARTY-NOTICES.txt`.

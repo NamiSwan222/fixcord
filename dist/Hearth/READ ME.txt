@@ -24,7 +24,13 @@ Voice chat
   Settings > Voice & sound: pick your microphone and speakers, test your mic, choose
   voice activity or push to talk, set volumes, and turn interface sounds on or off.
   Right-click a friend on the voice screen to change just their volume.
-  Noise suppression (on by default) removes background noise from your mic.
+  Noise suppression (on by default) removes background noise from your mic: DeepFilterNet
+  removes the most, RNNoise is lighter for older computers.
+
+Games
+  Press the game controller button in the Home Network community (or on the voice screen)
+  to open Activities and start multiplayer Snake. Friends on your network get an invite.
+  Steer with the arrow keys or W A S D.
   Headphones avoid echo.
 
 Updates

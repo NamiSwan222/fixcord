@@ -5,6 +5,7 @@ mod audio;
 mod media;
 mod model;
 mod net;
+mod snake;
 mod theme;
 mod update;
 

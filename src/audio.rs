@@ -88,6 +88,12 @@ struct Shared {
     deafened: AtomicBool,
     echo_reduce: AtomicBool,
     noise_suppression: AtomicBool,
+    /// 0 = RNNoise, 1 = DeepFilterNet.
+    noise_model: std::sync::atomic::AtomicU8,
+    /// DeepFilterNet: most it may turn noise down, in dB.
+    df_limit_db: AtomicU32,
+    /// DeepFilterNet is loaded and running (it takes a moment the first time).
+    df_ready: AtomicBool,
     loopback: AtomicBool,
     transmitting: AtomicBool,
     mic_db: AtomicU32,
@@ -249,6 +255,9 @@ impl Audio {
             deafened: AtomicBool::new(false),
             echo_reduce: AtomicBool::new(true),
             noise_suppression: AtomicBool::new(true),
+            noise_model: std::sync::atomic::AtomicU8::new(1),
+            df_limit_db: AtomicU32::new(100.0f32.to_bits()),
+            df_ready: AtomicBool::new(false),
             loopback: AtomicBool::new(false),
             transmitting: AtomicBool::new(false),
             mic_db: AtomicU32::new((-100.0f32).to_bits()),
@@ -475,6 +484,17 @@ impl Audio {
         self.shared.noise_suppression.store(on, Ordering::Relaxed);
     }
 
+    /// `model`: 0 = RNNoise, 1 = DeepFilterNet. `limit_db`: most DeepFilterNet may remove.
+    pub fn set_noise_model(&self, model: u8, limit_db: f32) {
+        self.shared.noise_model.store(model.min(1), Ordering::Relaxed);
+        set_f(&self.shared.df_limit_db, limit_db.clamp(0.0, 100.0));
+    }
+
+    /// DeepFilterNet has finished loading and is cleaning the microphone.
+    pub fn deepfilter_ready(&self) -> bool {
+        self.shared.df_ready.load(Ordering::Relaxed)
+    }
+
     /// Hear your own microphone (to test it).
     pub fn set_loopback(&self, on: bool) {
         self.shared.loopback.store(on, Ordering::Relaxed);
@@ -611,6 +631,60 @@ struct MicProcessor {
     last_voice: Instant,
     seq: u32,
     denoiser: Box<nnnoiseless::DenoiseState<'static>>,
+    deep: DeepSlot,
+}
+
+/// DeepFilterNet3 (a neural-network noise suppressor) through deep-filter-rt, which runs the
+/// model on the CPU with tract. Cleans 10 ms at a time, about 30 ms behind.
+struct DeepFilter {
+    df: deep_filter_rt::tract::DfTract,
+    noisy: ndarray::Array2<f32>,
+    enh: ndarray::Array2<f32>,
+    limit_db: f32,
+}
+
+impl DeepFilter {
+    fn load() -> Option<DeepFilter> {
+        // Loading prepares the model; don't let a problem there take the microphone down.
+        let df = std::panic::catch_unwind(deep_filter_rt::tract::DfTract::default).ok()?;
+        let hop = df.hop_size;
+        if df.sr != RATE as usize || hop == 0 || FRAME % hop != 0 {
+            return None;
+        }
+        Some(DeepFilter { df, noisy: ndarray::Array2::zeros((1, hop)), enh: ndarray::Array2::zeros((1, hop)), limit_db: 100.0 })
+    }
+
+    /// Cleans one piece in place. False if the model failed (the piece is left as it was).
+    fn process(&mut self, frame: &mut [f32], limit_db: f32) -> bool {
+        if (limit_db - self.limit_db).abs() > 0.1 {
+            self.df.set_atten_lim(limit_db);
+            self.limit_db = limit_db;
+        }
+        let hop = self.df.hop_size;
+        for chunk in frame.chunks_mut(hop) {
+            if chunk.len() != hop {
+                return false;
+            }
+            for (d, s) in self.noisy.iter_mut().zip(chunk.iter()) {
+                *d = *s;
+            }
+            if self.df.process(self.noisy.view(), self.enh.view_mut()).is_err() {
+                return false;
+            }
+            for (d, s) in chunk.iter_mut().zip(self.enh.iter()) {
+                *d = s.clamp(-1.0, 1.0);
+            }
+        }
+        true
+    }
+}
+
+/// DeepFilterNet loads in the background the first time it's chosen; RNNoise cleans meanwhile.
+enum DeepSlot {
+    Off,
+    Loading(std::sync::mpsc::Receiver<Option<DeepFilter>>),
+    Ready(Box<DeepFilter>),
+    Failed,
 }
 
 impl MicProcessor {
@@ -624,7 +698,46 @@ impl MicProcessor {
             last_voice: Instant::now() - Duration::from_secs(10),
             seq: 0,
             denoiser: nnnoiseless::DenoiseState::new(),
+            deep: DeepSlot::Off,
         }
+    }
+
+    /// Clean the current piece with the chosen noise suppressor.
+    fn clean(&mut self) {
+        let shared = self.shared.clone();
+        if !shared.noise_suppression.load(Ordering::Relaxed) {
+            return;
+        }
+        if shared.noise_model.load(Ordering::Relaxed) == 1 {
+            // Start loading DeepFilterNet if needed, and pick it up once it's ready.
+            if matches!(self.deep, DeepSlot::Off) {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::Builder::new()
+                    .name("hearth-deepfilter-load".into())
+                    .spawn(move || {
+                        let _ = tx.send(DeepFilter::load());
+                    })
+                    .ok();
+                self.deep = DeepSlot::Loading(rx);
+            }
+            if let DeepSlot::Loading(rx) = &self.deep {
+                match rx.try_recv() {
+                    Ok(Some(df)) => self.deep = DeepSlot::Ready(Box::new(df)),
+                    Ok(None) | Err(std::sync::mpsc::TryRecvError::Disconnected) => self.deep = DeepSlot::Failed,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if let DeepSlot::Ready(df) = &mut self.deep {
+                let limit = f(&shared.df_limit_db);
+                if df.process(&mut self.frame, limit) {
+                    shared.df_ready.store(true, Ordering::Relaxed);
+                    return;
+                }
+                self.deep = DeepSlot::Failed;
+            }
+        }
+        shared.df_ready.store(false, Ordering::Relaxed);
+        denoise(&mut self.denoiser, &mut self.frame);
     }
 
     /// Mono samples at the device's rate (already volume-adjusted).
@@ -644,9 +757,8 @@ impl MicProcessor {
     /// One 20 ms piece is ready. Clean it first, then decide whether to send it.
     fn piece(&mut self) {
         let shared = &self.shared;
-        if shared.noise_suppression.load(Ordering::Relaxed) {
-            denoise(&mut self.denoiser, &mut self.frame);
-        }
+        self.clean();
+        let shared = &self.shared;
         let level = db(rms(&self.frame));
         set_f(&shared.mic_db, level);
         let open = if shared.ptt_mode.load(Ordering::Relaxed) {
@@ -780,6 +892,53 @@ mod tests {
         let packets: Vec<Vec<u8>> = rx.try_iter().collect();
         assert!(packets.len() > 450 && packets.len() <= 501, "sent {}", packets.len());
         assert!(packets.iter().all(|p| p.len() == 15 + FRAME * 2 && &p[..3] == MAGIC));
+    }
+
+    /// DeepFilterNet turns steady hiss down much further than RNNoise, and fast enough for
+    /// live voice (here: 10 s of sound must take under 5 s, measured after loading).
+    #[test]
+    fn deepfilter_removes_hiss_and_keeps_up() {
+        let mut df = DeepFilter::load().expect("DeepFilterNet loads");
+        let mut seed: u32 = 777;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.1
+        };
+        let (mut before, mut after) = (0.0, 0.0);
+        let start = Instant::now();
+        for i in 0..500 {
+            // 500 × 20 ms = 10 s
+            let mut frame: Vec<f32> = (0..FRAME).map(|_| noise()).collect();
+            let r_in = rms(&frame);
+            assert!(df.process(&mut frame, 100.0));
+            if i >= 50 {
+                before += r_in;
+                after += rms(&frame);
+            }
+        }
+        let took = start.elapsed();
+        eprintln!("DeepFilterNet: 10 s of sound in {took:?}; hiss {before:.2} -> {after:.2}");
+        assert!(after < before * 0.2, "noise only went from {before} to {after}");
+        assert!(took < Duration::from_secs(5), "10 s of sound took {took:?}");
+    }
+
+    /// While DeepFilterNet loads, the microphone keeps working (RNNoise cleans meanwhile),
+    /// and once loaded it takes over.
+    #[test]
+    fn deepfilter_takes_over_after_loading() {
+        let audio = Audio::new(9, false);
+        let shared = audio.shared.clone();
+        audio.set_noise_model(1, 100.0);
+        let (tx, rx) = channel::<Vec<u8>>();
+        let mut proc = MicProcessor::new(shared.clone(), Some(tx), 9, RATE);
+        set_f(&shared.threshold_db, -100.0);
+        let tone: Vec<f32> = (0..FRAME).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
+        let t = Instant::now();
+        while !audio.deepfilter_ready() && t.elapsed() < Duration::from_secs(60) {
+            proc.feed(&tone);
+        }
+        assert!(audio.deepfilter_ready(), "DeepFilterNet never took over");
+        assert!(rx.try_iter().count() > 0, "sound kept flowing while it loaded");
     }
 
     /// Steady hiss (like a fan) is turned down a lot by the noise suppressor.

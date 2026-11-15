@@ -188,6 +188,10 @@ pub struct Settings {
     pub echo_reduction: bool,
     /// Remove background noise from the microphone (RNNoise).
     pub noise_suppression: bool,
+    /// 0 = RNNoise (light), 1 = DeepFilterNet (stronger).
+    pub noise_model: u8,
+    /// DeepFilterNet: most it may turn noise down, in dB (100 = no limit).
+    pub df_strength_db: f32,
     // Updates
     pub auto_update_check: bool,
     pub auto_update_install: bool,
@@ -243,6 +247,8 @@ impl Default for Settings {
             mic_sensitivity_db: -45.0,
             echo_reduction: true,
             noise_suppression: true,
+            noise_model: 1,
+            df_strength_db: 100.0,
             auto_update_check: true,
             auto_update_install: true,
             user_volumes: Default::default(),

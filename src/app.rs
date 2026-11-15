@@ -4,6 +4,9 @@ use crate::audio::{self, Audio, Sfx};
 use crate::media::{self, Capture, Choice, Source, StreamSettings, Viewer, What};
 use crate::model::*;
 use crate::net::{Lan, Packet, StreamAd};
+mod activities;
+use activities::{GameInvite, GameSession};
+use crate::snake::{self, Board, Dir as SnakeDir, Phase as SnakePhase};
 use crate::theme::{self, Palette};
 use crate::update;
 use chrono::{Datelike, Local, TimeZone};
@@ -152,6 +155,12 @@ pub struct HearthApp {
     attention: bool,
     /// Lets streaming threads ask for a redraw the moment a picture arrives.
     egui_ctx: Option<egui::Context>,
+    // Activities (games)
+    game: Option<GameSession>,
+    game_invites: HashMap<u64, GameInvite>,
+    hidden_invites: HashSet<u64>,
+    show_game: bool,
+    activities_open: bool,
     // Screen sharing and video
     share_screen: Option<Capture>,
     camera: Option<Capture>,
@@ -282,6 +291,11 @@ impl HearthApp {
             applied_on_top: None,
             attention: false,
             egui_ctx: None,
+            game: None,
+            game_invites: HashMap::new(),
+            hidden_invites: HashSet::new(),
+            show_game: false,
+            activities_open: false,
             share_screen: None,
             camera: None,
             viewers: HashMap::new(),
@@ -384,6 +398,13 @@ impl HearthApp {
             if let Some(pg) = pg {
                 app.settings_open = true;
                 app.settings_page = pg;
+            }
+            if page == "snake" {
+                app.host_snake();
+                app.preview_round();
+            }
+            if page == "activities" {
+                app.activities_open = true;
             }
             if page == "stage" || page == "golive" {
                 let room = app
@@ -808,6 +829,7 @@ impl HearthApp {
             }
         }
         self.sync_lan_voice();
+        self.tick_game(now);
     }
 
     /// Put home-network peers into the Home Network voice channel they say they're in,
@@ -1089,6 +1111,7 @@ impl HearthApp {
         );
         self.audio.set_loopback(self.mic_test);
         self.audio.set_noise_suppression(s.noise_suppression);
+        self.audio.set_noise_model(s.noise_model, s.df_strength_db);
         let want_mic = self.voice.is_some() || self.mic_test;
         if want_mic {
             self.audio.ensure_output(s.output_device.as_deref());
@@ -1101,6 +1124,10 @@ impl HearthApp {
     fn on_packet(&mut self, p: Packet, ip: std::net::IpAddr, now: f64) {
         let (from, name) = match &p {
             Packet::Hello { from, name, .. } | Packet::Say { from, name, .. } => (*from, name.clone()),
+            _ => {
+                self.on_game_packet(p, now);
+                return;
+            }
         };
         let name: String = name.chars().take(32).collect();
         let uid = peer_user_id(from);
@@ -1613,6 +1640,14 @@ impl eframe::App for HearthApp {
 
         self.rail(ui, &p);
         self.sidebar(ui, &p, now);
+        self.game_toast(&ctx, &p);
+        self.activities_dialog(&ctx, &p);
+        if self.show_game && self.game.is_some() {
+            self.game_view(ui, &p, now);
+            self.popups(&ctx, &p);
+            self.dialogs(&ctx, &p);
+            return;
+        }
         if self.show_stage && self.voice.is_some() {
             self.stage(ui, &p, now);
             self.popups(&ctx, &p);
@@ -2077,6 +2112,9 @@ impl HearthApp {
                 if self.share_screen.is_some() || self.camera.is_some() {
                     buttons.push(("⚙", "Stream options: what you share, quality and frame rate", false, p.accent, 4));
                 }
+                if c == HOME_NET_COMMUNITY {
+                    buttons.push(("🎮", "Activities: play a game together", false, p.accent, 6));
+                }
                 buttons.push(("✖", "Leave voice channel", true, p.danger, 3));
                 let gap = 16.0;
                 let total = buttons.len() as f32 * 52.0 + (buttons.len() as f32 - 1.0) * gap;
@@ -2196,6 +2234,7 @@ impl HearthApp {
             Some(1) => self.toggle_capture(Source::Camera),
             Some(2) => self.toggle_capture(Source::Screen),
             Some(3) => self.leave_voice(),
+            Some(6) => self.activities_open = true,
             Some(4) => {
                 let src = if self.share_screen.is_some() { Source::Screen } else { Source::Camera };
                 self.open_go_live(src, true);
@@ -3195,6 +3234,11 @@ impl HearthApp {
                             self.data.settings.show_members = !self.data.settings.show_members;
                             self.show_pins = false;
                             self.dirty = true;
+                        }
+                        if self.community == Some(HOME_NET_COMMUNITY)
+                            && icon_button(ui, "🎮", "Activities: play a game with friends", self.activities_open, p).clicked()
+                        {
+                            self.activities_open = true;
                         }
                         if icon_button(ui, "📌", "Pinned messages", self.show_pins, p).clicked() {
                             self.show_pins = !self.show_pins;
@@ -4380,6 +4424,7 @@ impl HearthApp {
         let mic_live = self.audio.transmitting();
         let audio_error = self.audio.error();
         let glitches = self.audio.glitches();
+        let df_ready = self.audio.deepfilter_ready();
         let update_state = self.updater.state();
         let update_failed = self.update_failed.clone();
         let mut check_updates = false;
@@ -4666,8 +4711,36 @@ impl HearthApp {
                                                 .on_hover_text("The mic opens when the level bar passes the white line. Lower = picks up quieter voices (and more background noise).");
                                         });
                                     }
-                                    ui.checkbox(&mut s.noise_suppression, "Noise suppression: remove background noise like fans, typing and hum")
-                                        .on_hover_text("Uses RNNoise, an open-source noise suppressor (here its Rust version, nnnoiseless).");
+                                    ui.checkbox(&mut s.noise_suppression, "Noise suppression: remove background noise like fans, typing and hum");
+                                    ui.add_enabled_ui(s.noise_suppression, |ui| {
+                                        ui.indent("noise_model", |ui| {
+                                            ui.radio_value(&mut s.noise_model, 1, "DeepFilterNet: removes the most noise (a neural network; uses a bit more of the computer)")
+                                                .on_hover_text("DeepFilterNet3, run on your computer by deep-filter-rt. Adds about 30 ms of delay.");
+                                            ui.radio_value(&mut s.noise_model, 0, "RNNoise: lighter, for older computers")
+                                                .on_hover_text("RNNoise, here its Rust version nnnoiseless.");
+                                            if s.noise_model == 1 {
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Strength");
+                                                    for (db, label) in [(12.0f32, "Gentle"), (24.0, "Medium"), (40.0, "Strong"), (100.0, "Maximum")] {
+                                                        if ui.selectable_label((s.df_strength_db - db).abs() < 0.5, label)
+                                                            .on_hover_text(format!("Turns noise down by up to {db:.0} dB. Gentler keeps more of the room's sound and sounds more natural."))
+                                                            .clicked()
+                                                        {
+                                                            s.df_strength_db = db;
+                                                        }
+                                                    }
+                                                });
+                                                if mic_test_on || self.voice.is_some() {
+                                                    let (txt, col) = if df_ready {
+                                                        ("DeepFilterNet is cleaning your microphone.", theme::status_color(Status::Online))
+                                                    } else {
+                                                        ("DeepFilterNet is starting… (RNNoise cleans meanwhile)", p.faint)
+                                                    };
+                                                    ui.label(RichText::new(txt).size(12.0).color(col));
+                                                }
+                                            }
+                                        });
+                                    });
                                     ui.checkbox(&mut s.echo_reduction, "Reduce echo: don't send while friends are talking (use it without headphones)");
 
                                     // Per-friend volumes

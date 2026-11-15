@@ -36,6 +36,27 @@ pub enum Packet {
     },
     /// A chat message in one of the shared channels.
     Say { from: u64, name: String, channel: String, text: String, id: u64 },
+    /// Snake: the host's board (also tells everyone a game exists, so they can join).
+    SnakeBoard { from: u64, game: u64, host: String, board: crate::snake::Board },
+    /// Snake: "let me play" (sent to the host's game).
+    SnakeJoin { from: u64, game: u64, name: String, hue: u8 },
+    /// Snake: a key press.
+    SnakeInput { from: u64, game: u64, dir: crate::snake::Dir },
+    /// Snake: "I'm leaving".
+    SnakeLeave { from: u64, game: u64 },
+}
+
+impl Packet {
+    pub fn sender(&self) -> u64 {
+        match self {
+            Packet::Hello { from, .. }
+            | Packet::Say { from, .. }
+            | Packet::SnakeBoard { from, .. }
+            | Packet::SnakeJoin { from, .. }
+            | Packet::SnakeInput { from, .. }
+            | Packet::SnakeLeave { from, .. } => *from,
+        }
+    }
 }
 
 pub struct Lan {
@@ -53,7 +74,8 @@ impl Lan {
         reader.set_read_timeout(Some(Duration::from_millis(500))).ok();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let mut buf = [0u8; 8192];
+            // Big enough for a full game board.
+            let mut buf = vec![0u8; 65_536];
             loop {
                 match reader.recv_from(&mut buf) {
                     Ok((n, addr)) => {
@@ -81,10 +103,7 @@ impl Lan {
     pub fn poll(&self) -> Vec<(Packet, IpAddr)> {
         let mut out = vec![];
         while let Ok((p, ip)) = self.rx.try_recv() {
-            let from = match &p {
-                Packet::Hello { from, .. } | Packet::Say { from, .. } => *from,
-            };
-            if from != self.instance {
+            if p.sender() != self.instance {
                 out.push((p, ip));
             }
         }

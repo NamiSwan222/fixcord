@@ -30,6 +30,14 @@ Both are distributed under the BSD 3-Clause License:
   (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+DeepFilterNet noise suppression
+-------------------------------
+Hearth's stronger noise suppression runs the DeepFilterNet3 model
+(https://github.com/Rikorose/DeepFilterNet, Copyright (c) Hendrik Schröter and contributors)
+through deep-filter-rt (https://gitlab.com/chpio/voice-filter), which includes the model,
+and the tract neural-network runner (Copyright (c) Sonos, Inc. and contributors).
+All are distributed under the MIT License and/or the Apache License 2.0.
+
 Other libraries
 ---------------
 The window and drawing (egui/eframe), sound (cpal), screen capture (xcap),
